@@ -1,5 +1,6 @@
 import { closeSync, existsSync, fstatSync, openSync, readSync } from "node:fs";
-import { basename, join } from "node:path";
+import { homedir } from "node:os";
+import { basename, isAbsolute, join } from "node:path";
 
 export type Agent = "claude" | "codex";
 export type Phase = "start" | "pre" | "post" | "stop" | "other";
@@ -224,9 +225,22 @@ const unquote = (t: string): string => t.replace(/^["']|["']$/g, "");
 /** A quoted shell string. Inside double quotes `\"` is text, not the end: `echo "{\"a\": 1};" > f`. */
 const QUOTED = String.raw`"(?:\\.|[^"\\])*"|'[^']*'`;
 
-/** Shell word splitting, kept in one place so every argument list splits the same way. */
+/**
+ * Shell word splitting, kept in one place so every argument list splits the same way. A word may
+ * hold quotes, a `$(…)` substitution, or backticks: `b-$(date +%s).ts` is one word, not two (#22).
+ */
 // Safe to share: `String.prototype.match` with a `/g` regex resets `lastIndex`. Do not use with `.test`.
-const TOKENS = new RegExp(String.raw`${QUOTED}|\S+`, "g");
+const TOKENS = new RegExp(
+  String.raw`(?:${QUOTED}|\$\((?:[^()]|\([^()]*\))*\)|\`[^\`]*\`|[^\s"'\`]|["'\`])+`,
+  "g",
+);
+
+/**
+ * Quoted text blanked to `x`, quotes kept and length unchanged, so a match found in it indexes the
+ * original. A command quoted for `ssh` or a pattern for `grep` (`"cp |mv "`) runs nothing here.
+ */
+const maskQuotes = (cmd: string): string =>
+  cmd.replace(new RegExp(QUOTED, "g"), (q) => q[0] + "x".repeat(q.length - 2) + q[0]);
 
 export interface FileOps {
   /** Destinations of `cp` and `mv`, and files `git checkout --` or `git restore` overwrite. */
@@ -241,12 +255,13 @@ export interface FileOps {
 // ponytail: reads rm, cp, mv and git at command position, after `then`/`do`/`else`, or by path; `find -exec rm`, `xargs rm`, and a second heredoc on one command line are not seen
 export function fileOps(cmd: string): FileOps {
   const ops: FileOps = { written: [], removed: [], moved: [] };
-  const found = withoutHeredocs(cmd).matchAll(
-    /(?:^|[;&|(\n]|\b(?:then|do|else)\s)\s*(?:sudo\s+)?(?:[^\s;&|]*\/)?(rm|cp|mv|git\s+(?:rm|mv|checkout|restore))\s+([^;&|\n]*)/g,
+  const text = withoutHeredocs(cmd);
+  const found = maskQuotes(text).matchAll(
+    /(?:^|[;&|(\n]|\b(?:then|do|else)\s)\s*(?:sudo\s+)?(?:[^\s;&|]*\/)?(rm|cp|mv|git\s+(?:rm|mv|checkout|restore))\s+([^;&|\n]*)/dg,
   );
   for (const m of found) {
     const op = m[1]!.replace(/\s+/g, " ");
-    let tokens: string[] = m[2]!.match(TOKENS) ?? [];
+    let tokens: string[] = text.slice(...m.indices![2]!).match(TOKENS) ?? [];
     const redirect = tokens.findIndex((t) => /^\d?[<>]/.test(t));
     if (redirect >= 0) tokens = tokens.slice(0, redirect);
     const dashes = tokens.indexOf("--");
@@ -279,8 +294,50 @@ export function fileOps(cmd: string): FileOps {
 /** Every file a shell command changes, as far as its text shows. */
 const shellChanges = (cmd: string): string[] => {
   const ops = fileOps(cmd);
-  return [...writeTargets(cmd), ...ops.written, ...ops.removed, ...ops.moved.map(([from]) => from)];
+  const paths = [
+    ...writeTargets(cmd),
+    ...ops.written,
+    ...ops.removed,
+    ...ops.moved.map(([from]) => from),
+  ];
+  const dir = leadingCd(cmd);
+  return paths
+    .flatMap((p) => expandVars(p, cmd))
+    .map((p) => (dir && !isAbsolute(p) ? join(dir, p) : p));
 };
+
+/** Text no shell expansion touched: no variable, glob, or substitution. */
+const LITERAL = /^[^$*?[`\\]+$/;
+
+/**
+ * A path holding `$name` is the files a literal `for name in …` lists. A variable the command does
+ * not define this way names no file Canny can point at, so it names none: `$f`, `$DST/a.ts`, `\$B`.
+ */
+// ponytail: only `for` lists; a variable set by `VAR=…`, `read`, or the environment drops the path
+function expandVars(path: string, cmd: string): string[] {
+  if (!/[$`]/.test(path)) return [path];
+  // `$(…)`, backticks, and `${x:-y}` run or default at run time, so their file cannot be named.
+  const v = /\$(?:\{(\w+)\}|(\w+))/.exec(path);
+  if (!v || /\$\(|`/.test(path)) return [];
+  const name = v[1] ?? v[2]!;
+  const loop = new RegExp(
+    String.raw`\bfor\s+${name}\s+in\s+([^;\n]*?)\s*(?:;|\n)\s*do\b`,
+    "d",
+  ).exec(maskQuotes(cmd));
+  if (!loop) return [];
+  const items = (cmd.slice(...loop.indices![1]!).match(TOKENS) ?? []).map(unquote);
+  if (!items.length || !items.every((i) => LITERAL.test(i))) return [];
+  return items.flatMap((i) => expandVars(path.replace(v[0], i), cmd));
+}
+
+/** Where relative paths land when the command starts by changing directory: `cd web; sed -i … x.html`. */
+// ponytail: only a leading `cd`; one later in the command is not followed
+function leadingCd(cmd: string): string | null {
+  const m = new RegExp(String.raw`^\s*cd\s+(${QUOTED}|[^\s;&|]+)\s*(?:;|&&|\n)`).exec(cmd);
+  if (!m) return null;
+  const dir = unquote(m[1]!).replace(/^~(?=\/|$)/, homedir());
+  return LITERAL.test(dir) ? dir : null;
+}
 
 /** `echo` or `printf` as a word anywhere in the statement, so wrappers such as `command`, `env`, and `then` need no list. */
 // ponytail: text written by an interpreter (`python -c`, `node -e`) is not read; add when it shows up in ledgers
@@ -351,10 +408,11 @@ const TAKES_SCRIPT = /^(?:-[a-zA-Z]*[ef]|--expression|--file)$/;
 function inPlace(cmd: string): { scripts: string[]; files: string[] }[] {
   const out: { scripts: string[]; files: string[] }[] = [];
   // Quoted strings are whole arguments: a script holds `;` and `|` that end nothing.
-  const call = new RegExp(String.raw`\b(sed|perl)\s+((?:${QUOTED}|[^;&|\n"'])+)`, "g");
-  for (const m of cmd.matchAll(call)) {
+  const call = new RegExp(String.raw`\b(sed|perl)\s+((?:${QUOTED}|[^;&|\n"'])+)`, "dg");
+  const text = withoutHeredocs(cmd);
+  for (const m of maskQuotes(text).matchAll(call)) {
     const flag = IN_PLACE[m[1] as "sed" | "perl"];
-    const tokens: string[] = m[2]!.match(TOKENS) ?? [];
+    const tokens: string[] = text.slice(...m.indices![2]!).match(TOKENS) ?? [];
     if (!tokens.some((t) => flag.test(t))) continue;
     const edit = { scripts: [] as string[], files: [] as string[] };
     const named = tokens.some((t) => TAKES_SCRIPT.test(t) || t.startsWith("--expression="));
